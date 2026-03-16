@@ -75,7 +75,21 @@ npm run build
 
 ### Windows
 
-Windows 一键安装包需要在 Windows 机器上生成。
+Windows 一键安装包有两种获取方式：
+
+#### 方式 1：直接下载已发布安装包（推荐）
+
+1. 打开 GitHub 仓库的 `Releases` 页面
+2. 下载：`Duokai2 Setup.exe`
+3. 双击安装
+4. 安装完成后从桌面快捷方式或开始菜单启动
+
+补充说明：
+
+- GitHub Actions 还会同步上传 `Actions Artifacts`，便于内部测试下载
+- 正式给好友使用时，优先让对方下载 `GitHub Releases` 里的安装包
+
+#### 方式 2：在 Windows 机器上本地打包
 
 在 Windows 机器上执行：
 
@@ -88,19 +102,13 @@ npm run build
 会生成类似以下文件：
 
 - `Duokai2 Setup.exe` 或等价 `NSIS` 安装器
-- `win zip` 便携包
-
-安装方式：
-
-1. 双击 `NSIS .exe` 安装包
-2. 按安装向导完成安装
-3. 从桌面快捷方式或开始菜单启动
+- `Duokai2-win.zip` 便携包
 
 说明：
 
 - 当前阶段未做代码签名
 - Windows 安装时可能出现 `SmartScreen` 提示，内测阶段可手动继续
-- 不建议在当前这台 Mac 上直接产 Windows 安装包，优先使用 Windows 机器本地打包
+- 当前仓库已支持通过 GitHub Actions 在 `windows-latest` 上手动构建并发布 Windows 安装包
 
 ## 说明
 
