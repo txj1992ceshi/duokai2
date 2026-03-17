@@ -21,6 +21,7 @@ import type {
   ProxyRecord,
   ProxyTestResult,
   RuntimeStatus,
+  RuntimeHostInfo,
   SettingsPayload,
   TemplateRecord,
   UpdateCloudPhoneInput,
@@ -86,6 +87,7 @@ export interface DesktopApi {
     launch: (profileId: string) => Promise<void>
     stop: (profileId: string) => Promise<void>
     getStatus: () => Promise<RuntimeStatus>
+    getHostInfo: () => Promise<RuntimeHostInfo>
   }
   logs: {
     list: () => Promise<LogEntry[]>

@@ -185,6 +185,34 @@
   gap: 10px;
 }
 
+.metric-card-compact {
+  gap: 14px;
+  align-content: start;
+}
+
+.status-summary-card {
+  grid-column: span 2;
+}
+
+.status-summary-row {
+  display: grid;
+  gap: 4px;
+}
+
+.status-summary-row + .status-summary-row {
+  padding-top: 12px;
+  border-top: 1px solid rgba(15, 37, 64, 0.08);
+}
+
+.status-summary-row strong {
+  font-size: 1.1rem;
+  line-height: 1.2;
+}
+
+.status-summary-row small {
+  line-height: 1.45;
+}
+
 .metric-card span,
 .metric-card small {
   color: #60758f;

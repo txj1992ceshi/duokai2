@@ -41,6 +41,16 @@ import {
   resolveChromiumExecutable,
 } from './services/runtime'
 import { buildFingerprintInitScript } from './services/fingerprint'
+import { applyNetworkDerivedFingerprint } from './services/networkProfileResolver'
+import { RuntimeScheduler } from './services/runtimeScheduler'
+import { validateProfileForLaunch } from './services/profileValidator'
+import { ContainerManager } from './services/containerManager'
+import {
+  isRuntimeHostSupported,
+  resolveRequestedRuntimeKind,
+} from './services/runtimeIsolation'
+import { checkNetworkHealth, type NetworkHealthResult } from './services/networkCheck'
+import { buildNetworkDiagnosticsSummary } from './services/networkDiagnostics'
 import type {
   CloudPhoneBulkActionPayload,
   CloudPhoneRecord,
@@ -62,7 +72,6 @@ import type {
 } from '../src/shared/types'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const TIMEZONE_LOOKUP_URL = 'https://ipwho.is/?output=json'
 const DEFAULT_TIMEZONE_FALLBACK = 'America/Los_Angeles'
 const DEFAULT_CONCURRENT_STARTS = 2
 const DEFAULT_ACTIVE_LIMIT = 6
@@ -72,12 +81,6 @@ let mainWindow: BrowserWindow | null = null
 let db: DatabaseService | null = null
 
 const runtimeContexts = new Map<string, BrowserContext>()
-const queuedProfileIds = new Set<string>()
-const startingProfileIds = new Set<string>()
-const launchRetryCounts = new Map<string, number>()
-const launchQueue: string[] = []
-const cancelledLaunches = new Set<string>()
-let launchQueueActive = false
 const MAX_QUEUE = Number(process.env.MAX_QUEUE_LENGTH || 200)
 
 function resolveAuditLogPath(): string {
@@ -155,6 +158,7 @@ cloudPhoneProviderRegistry.register(new SelfHostedCloudPhoneProvider())
 cloudPhoneProviderRegistry.register(new ThirdPartyCloudPhoneProvider())
 cloudPhoneProviderRegistry.register(new LocalEmulatorCloudPhoneProvider())
 cloudPhoneProviderRegistry.register(new MockCloudPhoneProvider())
+const runtimeHostManager = new ContainerManager()
 
 const isDev = !app.isPackaged
 const rendererUrl = process.env.VITE_DEV_SERVER_URL
@@ -276,23 +280,18 @@ async function updateProfileStatus(
 }
 
 async function stopRuntime(profileId: string): Promise<void> {
-  cancelledLaunches.add(profileId)
-  queuedProfileIds.delete(profileId)
-  startingProfileIds.delete(profileId)
-  const queuedIndex = launchQueue.indexOf(profileId)
-  if (queuedIndex >= 0) {
-    launchQueue.splice(queuedIndex, 1)
-  }
+  scheduler.cancel(profileId)
   const context = runtimeContexts.get(profileId)
   if (!context) {
+    await runtimeHostManager.stopEnvironment(profileId)
     await updateProfileStatus(profileId, 'stopped')
     return
   }
 
   runtimeContexts.delete(profileId)
   await context.close()
-  launchRetryCounts.delete(profileId)
-  void processLaunchQueue()
+  await runtimeHostManager.stopEnvironment(profileId)
+  scheduler.markStopped(profileId)
 }
 
 async function launchMany(profileIds: string[]): Promise<void> {
@@ -366,25 +365,6 @@ async function refreshCloudPhoneStatuses(): Promise<CloudPhoneRecord[]> {
   return database.listCloudPhones()
 }
 
-type TimezoneProfileLike = Pick<ProfileRecord, 'id' | 'name' | 'proxyId' | 'fingerprintConfig'>
-
-type NetworkProfileLookupResult = {
-  ip: string | null
-  timezone: string
-  countryCode: string
-  country: string
-  region: string
-  city: string
-  latitude: number | null
-  longitude: number | null
-  source: 'proxy' | 'local'
-}
-
-type LaunchValidationResult = {
-  level: 'pass' | 'warn' | 'block'
-  messages: string[]
-}
-
 function getRuntimeNumberSetting(key: string, fallback: number): number {
   const value = Number(getSettings()[key])
   if (!Number.isFinite(value) || value <= 0) {
@@ -405,76 +385,51 @@ function getMaxLaunchRetries(): number {
   return getRuntimeNumberSetting('runtimeMaxLaunchRetries', DEFAULT_LAUNCH_RETRIES)
 }
 
-function languageFromCountry(countryCode: string): string {
-  const mapping: Record<string, string> = {
-    US: 'en-US',
-    GB: 'en-GB',
-    AU: 'en-AU',
-    CA: 'en-CA',
-    JP: 'ja-JP',
-    KR: 'ko-KR',
-    CN: 'zh-CN',
-    TW: 'zh-TW',
-    HK: 'zh-TW',
-    SG: 'en-SG',
-    DE: 'de-DE',
-    FR: 'fr-FR',
-    ES: 'es-ES',
-    IT: 'it-IT',
-    BR: 'pt-BR',
-    MX: 'es-MX',
-  }
-  return mapping[countryCode.toUpperCase()] ?? 'en-US'
-}
-
-function buildGeolocationValue(latitude: number | null, longitude: number | null): string {
-  if (latitude === null || longitude === null) {
-    return ''
-  }
-  return `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`
-}
-
-function parseLookupPayload(payload: unknown): Omit<NetworkProfileLookupResult, 'source'> | null {
-  if (!payload || typeof payload !== 'object') {
-    return null
-  }
-  const data = payload as {
-    success?: boolean
-    ip?: unknown
-    timezone?: unknown
-    country_code?: unknown
-    country?: unknown
-    region?: unknown
-    city?: unknown
-    latitude?: unknown
-    longitude?: unknown
-  }
-  if (data.success === false) {
-    return null
-  }
-  const timezone =
-    typeof data.timezone === 'string'
-      ? data.timezone
-      : data.timezone && typeof data.timezone === 'object' && 'id' in data.timezone
-        ? (data.timezone as { id?: unknown }).id
-        : null
-  if (typeof timezone !== 'string' || timezone.trim().length === 0) {
-    return null
-  }
+function getRuntimeHostInfo() {
+  const settings = getSettings()
+  const kind = resolveRequestedRuntimeKind(settings)
+  const available = isRuntimeHostSupported(kind)
   return {
-    ip: typeof data.ip === 'string' ? data.ip : null,
-    timezone: timezone.trim(),
-    countryCode: typeof data.country_code === 'string' ? data.country_code : '',
-    country: typeof data.country === 'string' ? data.country : '',
-    region: typeof data.region === 'string' ? data.region : '',
-    city: typeof data.city === 'string' ? data.city : '',
-    latitude: typeof data.latitude === 'number' ? data.latitude : null,
-    longitude: typeof data.longitude === 'number' ? data.longitude : null,
+    kind,
+    label: available ? kind : `local fallback for ${kind}`,
+    available,
+    reason: available
+      ? 'runtime host ready'
+      : `runtime host "${kind}" is unavailable on this platform; falling back to local`,
+    activeHosts: runtimeHostManager.listEnvironments().length,
   }
+}
+
+function persistProfile(profile: ProfileRecord): ProfileRecord {
+  return requireDatabase().updateProfile({
+    id: profile.id,
+    name: profile.name,
+    proxyId: profile.proxyId,
+    groupName: profile.groupName,
+    tags: profile.tags,
+    notes: profile.notes,
+    fingerprintConfig: profile.fingerprintConfig,
+  })
+}
+
+function updateRuntimeMetadata(
+  profile: ProfileRecord,
+  metadataPatch: Partial<ProfileRecord['fingerprintConfig']['runtimeMetadata']>,
+): ProfileRecord {
+  return persistProfile({
+    ...profile,
+    fingerprintConfig: {
+      ...profile.fingerprintConfig,
+      runtimeMetadata: {
+        ...profile.fingerprintConfig.runtimeMetadata,
+        ...metadataPatch,
+      },
+    },
+  })
 }
 
 function resolveProfileProxy(
-  profile: TimezoneProfileLike,
+  profile: Pick<ProfileRecord, 'id' | 'proxyId' | 'fingerprintConfig'> | UpdateProfileInput,
   database: DatabaseService,
 ): ProxyRecord | null {
   const proxySettings = profile.fingerprintConfig.proxySettings
@@ -483,7 +438,7 @@ function resolveProfileProxy(
   }
   if (proxySettings.proxyMode === 'custom' && proxySettings.host && proxySettings.port > 0) {
     return {
-      id: profile.id ? `${profile.id}-custom-proxy` : 'custom',
+      id: 'id' in profile && profile.id ? `${profile.id}-custom-proxy` : 'custom',
       name: 'Custom profile proxy',
       type: proxySettings.proxyType,
       host: proxySettings.host,
@@ -499,92 +454,6 @@ function resolveProfileProxy(
   return null
 }
 
-async function lookupNetworkProfileWithoutProxy(): Promise<NetworkProfileLookupResult | null> {
-  try {
-    const response = await fetch(TIMEZONE_LOOKUP_URL)
-    if (!response.ok) {
-      return null
-    }
-    const data = parseLookupPayload(await response.json())
-    return data ? { ...data, source: 'local' } : null
-  } catch {
-    return null
-  }
-}
-
-async function lookupNetworkProfileWithProxy(proxy: ProxyRecord): Promise<NetworkProfileLookupResult | null> {
-  let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      executablePath: resolveChromiumExecutable(),
-      proxy: proxyToPlaywrightConfig(proxy) ?? undefined,
-    })
-    const page = await browser.newPage()
-    await page.goto(TIMEZONE_LOOKUP_URL, { waitUntil: 'domcontentloaded' })
-    const bodyText = (await page.textContent('body'))?.trim() ?? ''
-    const data = parseLookupPayload(bodyText ? JSON.parse(bodyText) : null)
-    return data ? { ...data, source: 'proxy' } : null
-  } catch {
-    return null
-  } finally {
-    await browser?.close().catch(() => undefined)
-  }
-}
-
-async function resolveNetworkProfileForProfile(
-  profile: TimezoneProfileLike,
-  database: DatabaseService,
-): Promise<NetworkProfileLookupResult | null> {
-  const proxy = resolveProfileProxy(profile, database)
-  if (proxy) {
-    const proxyLookup = await lookupNetworkProfileWithProxy(proxy)
-    if (proxyLookup) {
-      return proxyLookup
-    }
-  }
-  return lookupNetworkProfileWithoutProxy()
-}
-
-function applyNetworkProfileToFingerprint(
-  fingerprint: ProfileRecord['fingerprintConfig'],
-  lookup: NetworkProfileLookupResult | null,
-) {
-  if (!lookup) {
-    return fingerprint
-  }
-  const nextLanguage = fingerprint.advanced.autoLanguageFromIp
-    ? languageFromCountry(lookup.countryCode)
-    : fingerprint.language
-  const nextTimezone = fingerprint.advanced.autoTimezoneFromIp
-    ? lookup.timezone
-    : fingerprint.timezone || DEFAULT_TIMEZONE_FALLBACK
-  const nextGeolocation = fingerprint.advanced.autoGeolocationFromIp
-    ? buildGeolocationValue(lookup.latitude, lookup.longitude)
-    : fingerprint.advanced.geolocation
-
-  return {
-    ...fingerprint,
-    language: nextLanguage,
-    timezone: nextTimezone,
-    advanced: {
-      ...fingerprint.advanced,
-      geolocation: nextGeolocation,
-    },
-    runtimeMetadata: {
-      ...fingerprint.runtimeMetadata,
-      lastResolvedIp: lookup.ip ?? '',
-      lastResolvedCountry: lookup.country,
-      lastResolvedRegion: lookup.region,
-      lastResolvedCity: lookup.city,
-      lastResolvedTimezone: lookup.timezone,
-      lastResolvedLanguage: nextLanguage,
-      lastResolvedGeolocation: nextGeolocation,
-      lastResolvedAt: new Date().toISOString(),
-    },
-  }
-}
-
 async function applyResolvedNetworkProfileToPayload(
   payload: UpdateProfileInput,
   database: DatabaseService,
@@ -596,16 +465,18 @@ async function applyResolvedNetworkProfileToPayload(
   ) {
     return payload
   }
-  const lookup = await resolveNetworkProfileForProfile(
+  const proxy = resolveProfileProxy(payload, database)
+  const check = await checkNetworkHealth(
     {
-      id: payload.id,
-      name: payload.name,
-      proxyId: payload.proxyId,
-      fingerprintConfig: payload.fingerprintConfig,
+      ...payload,
+      status: 'stopped',
+      lastStartedAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     },
-    database,
+    proxy,
   )
-  if (!lookup) {
+  if (!check.ok) {
     logEvent(
       'warn',
       'profile',
@@ -614,102 +485,64 @@ async function applyResolvedNetworkProfileToPayload(
     )
     return payload
   }
+  const resolved = applyNetworkDerivedFingerprint(
+    {
+      ...payload,
+      status: 'stopped',
+      lastStartedAt: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+    check,
+  )
   return {
     ...payload,
-    fingerprintConfig: applyNetworkProfileToFingerprint(payload.fingerprintConfig, lookup),
+    fingerprintConfig: {
+      ...resolved.fingerprintConfig,
+      runtimeMetadata: {
+        ...resolved.fingerprintConfig.runtimeMetadata,
+        lastResolvedIp: check.ip,
+        lastResolvedCountry: check.country,
+        lastResolvedRegion: check.region,
+        lastResolvedCity: check.city,
+        lastResolvedTimezone: check.timezone,
+        lastResolvedLanguage: check.languageHint,
+        lastResolvedGeolocation: check.geolocation,
+        lastResolvedAt: new Date().toISOString(),
+        lastProxyCheckAt: new Date().toISOString(),
+        lastProxyCheckSuccess: check.ok,
+        lastProxyCheckMessage: check.message,
+      },
+    },
   }
 }
 
 async function runProxyPreflight(
   profile: ProfileRecord,
   database: DatabaseService,
-): Promise<{ proxy: ProxyRecord | null; lookup: NetworkProfileLookupResult | null }> {
+): Promise<{ proxy: ProxyRecord | null; check: NetworkHealthResult }> {
   const proxy = resolveProfileProxy(profile, database)
-  if (!proxy) {
-    return { proxy: null, lookup: await lookupNetworkProfileWithoutProxy() }
-  }
-
-  const lookup = await lookupNetworkProfileWithProxy(proxy)
-  const updatedMetadata = {
-    ...profile.fingerprintConfig.runtimeMetadata,
+  const check = await checkNetworkHealth(profile, proxy)
+  updateRuntimeMetadata(profile, {
+    lastResolvedIp: check.ip,
+    lastResolvedCountry: check.country,
+    lastResolvedRegion: check.region,
+    lastResolvedCity: check.city,
+    lastResolvedTimezone: check.timezone,
+    lastResolvedLanguage: check.languageHint,
+    lastResolvedGeolocation: check.geolocation,
+    lastResolvedAt: new Date().toISOString(),
     lastProxyCheckAt: new Date().toISOString(),
-    lastProxyCheckSuccess: Boolean(lookup),
-    lastProxyCheckMessage: lookup ? 'Proxy reachable' : 'Proxy connectivity check failed',
-  }
-  database.updateProfile({
-    ...profile,
-    fingerprintConfig: {
-      ...profile.fingerprintConfig,
-      runtimeMetadata: updatedMetadata,
-    },
+    lastProxyCheckSuccess: check.ok,
+    lastProxyCheckMessage: check.message,
   })
   if (profile.proxyId && profile.fingerprintConfig.proxySettings.proxyMode === 'manager') {
-    database.setProxyStatus(profile.proxyId, lookup ? 'online' : 'offline')
+    database.setProxyStatus(profile.proxyId, check.ok ? 'online' : 'offline')
   }
-  if (!lookup) {
+  if (!check.ok && proxy) {
     throw new Error(`Proxy preflight failed for "${profile.name}"`)
   }
-  return { proxy, lookup }
-}
-
-function buildLaunchValidation(
-  profile: ProfileRecord,
-  lookup: NetworkProfileLookupResult | null,
-): LaunchValidationResult {
-  const messages: string[] = []
-  let level: LaunchValidationResult['level'] = 'pass'
-  const fingerprint = profile.fingerprintConfig
-
-  if (
-    fingerprint.proxySettings.proxyMode !== 'direct' &&
-    !lookup
-  ) {
-    level = 'block'
-    messages.push('代理不可用，已阻止启动。')
-  }
-  if (
-    fingerprint.advanced.deviceMode === 'desktop' &&
-    /android|iphone|mobile/i.test(fingerprint.userAgent)
-  ) {
-    level = level === 'block' ? level : 'warn'
-    messages.push('当前 UA 与桌面设备模式不一致。')
-  }
-  if (
-    fingerprint.advanced.deviceMode !== 'desktop' &&
-    !/android|iphone|mobile/i.test(fingerprint.userAgent)
-  ) {
-    level = level === 'block' ? level : 'warn'
-    messages.push('当前 UA 与移动设备模式不一致。')
-  }
-  if (
-    fingerprint.advanced.windowWidth < 320 ||
-    fingerprint.advanced.windowHeight < 480
-  ) {
-    level = 'block'
-    messages.push('窗口尺寸过小，无法稳定启动。')
-  }
-  if (
-    lookup &&
-    fingerprint.timezone &&
-    fingerprint.timezone !== lookup.timezone &&
-    !fingerprint.advanced.autoTimezoneFromIp
-  ) {
-    level = level === 'block' ? level : 'warn'
-    messages.push('手动时区与当前 IP 不一致。')
-  }
-  if (
-    lookup &&
-    fingerprint.language &&
-    fingerprint.language !== languageFromCountry(lookup.countryCode) &&
-    !fingerprint.advanced.autoLanguageFromIp
-  ) {
-    level = level === 'block' ? level : 'warn'
-    messages.push('手动语言与当前 IP 地区不一致。')
-  }
-  if (messages.length === 0) {
-    messages.push('环境校验通过，可启动。')
-  }
-  return { level, messages }
+  return { proxy, check }
 }
 
 function buildInjectedFeatures(profile: ProfileRecord): string[] {
@@ -743,38 +576,42 @@ async function launchRuntimeNow(profileId: string): Promise<void> {
   if (runtimeContexts.has(profileId)) {
     return
   }
-  const { proxy, lookup } = await runProxyPreflight(profile, database)
-  if (cancelledLaunches.has(profileId)) {
-    cancelledLaunches.delete(profileId)
-    throw new Error('Launch cancelled')
-  }
-  profile = database.getProfileById(profileId) ?? profile
-  profile = {
-    ...profile,
-    fingerprintConfig: applyNetworkProfileToFingerprint(profile.fingerprintConfig, lookup),
-  }
-  const validation = buildLaunchValidation(profile, lookup)
-  profile = database.updateProfile({
-    ...profile,
-    fingerprintConfig: {
-      ...profile.fingerprintConfig,
-      timezone: profile.fingerprintConfig.timezone || DEFAULT_TIMEZONE_FALLBACK,
-      runtimeMetadata: {
-        ...profile.fingerprintConfig.runtimeMetadata,
-        lastValidationLevel: validation.level,
-        lastValidationMessages: validation.messages,
-        launchRetryCount: launchRetryCounts.get(profileId) ?? 0,
-      },
-    },
+  const proxy = resolveProfileProxy(profile, database)
+  const validation = validateProfileForLaunch(profile, proxy)
+  profile = updateRuntimeMetadata(profile, {
+    lastValidationLevel: validation.level,
+    lastValidationMessages: validation.messages,
+    launchRetryCount: scheduler.getRetryCounts()[profileId] ?? 0,
   })
   if (validation.level === 'block') {
     throw new Error(validation.messages.join(' '))
   }
 
+  const { proxy: resolvedProxy, check } = await runProxyPreflight(profile, database)
+  if (scheduler.isCancelled(profileId)) {
+    throw new Error('Launch cancelled')
+  }
+  profile = database.getProfileById(profileId) ?? profile
+  profile = persistProfile(applyNetworkDerivedFingerprint(profile, check))
+  profile = persistProfile({
+    ...profile,
+    fingerprintConfig: {
+      ...profile.fingerprintConfig,
+      timezone: profile.fingerprintConfig.timezone || DEFAULT_TIMEZONE_FALLBACK,
+    },
+  })
+
   const directoryInfo = getProfileDirectoryInfo(app)
   ensureProfileDirectory(directoryInfo.profilesDir)
   const userDataDir = getProfilePath(app, profileId)
   mkdirSync(userDataDir, { recursive: true })
+  const runtimeHost = await runtimeHostManager.startEnvironment(profileId, userDataDir, getSettings())
+  audit('runtime_host_ready', {
+    profileId,
+    kind: runtimeHost.kind,
+    available: runtimeHost.available,
+    reason: runtimeHost.reason,
+  })
 
   const settings = database.getSettings()
   const fingerprint = profile.fingerprintConfig
@@ -806,46 +643,42 @@ async function launchRuntimeNow(profileId: string): Promise<void> {
     ),
   }
 
-  const proxyConfig = proxyToPlaywrightConfig(proxy)
+  const proxyConfig = proxyToPlaywrightConfig(resolvedProxy)
   if (proxyConfig) {
     launchOptions.proxy = proxyConfig
   }
 
+  const diagnostics = buildNetworkDiagnosticsSummary(runtimeHost, check)
+  audit('runtime_network_diagnostics', {
+    profileId,
+    level: diagnostics.level,
+    messages: diagnostics.messages,
+  })
+
   const context = await chromium.launchPersistentContext(userDataDir, launchOptions)
-  if (cancelledLaunches.has(profileId)) {
-    cancelledLaunches.delete(profileId)
+  if (scheduler.isCancelled(profileId)) {
     await context.close()
     throw new Error('Launch cancelled')
   }
   runtimeContexts.set(profileId, context)
   database.touchProfileLastStarted(profileId)
-  await updateProfileStatus(profileId, 'running')
   const injectedFeatures = buildInjectedFeatures(profile)
-  profile = database.updateProfile({
-    ...profile,
-    fingerprintConfig: {
-      ...profile.fingerprintConfig,
-      runtimeMetadata: {
-        ...profile.fingerprintConfig.runtimeMetadata,
-        launchRetryCount: launchRetryCounts.get(profileId) ?? 0,
-        injectedFeatures,
-      },
-    },
+  profile = updateRuntimeMetadata(profile, {
+    launchRetryCount: scheduler.getRetryCounts()[profileId] ?? 0,
+    injectedFeatures,
   })
   logEvent(
     'info',
     'runtime',
-    `Launched profile "${profile.name}"${proxy ? ` via ${buildProxyServer(proxy)}` : ''}`,
+    `Launched profile "${profile.name}"${resolvedProxy ? ` via ${buildProxyServer(resolvedProxy)}` : ''}`,
     profileId,
   )
   await context.addInitScript(buildFingerprintInitScript(profile.id, profile.fingerprintConfig))
 
   context.on('close', () => {
     runtimeContexts.delete(profileId)
-    launchRetryCounts.delete(profileId)
-    void updateProfileStatus(profileId, 'stopped')
+    scheduler.markStopped(profileId)
     logEvent('info', 'runtime', `Closed profile "${profile.name}"`, profileId)
-    void processLaunchQueue()
   })
 
   const pages = context.pages()
@@ -865,106 +698,39 @@ async function launchRuntimeNow(profileId: string): Promise<void> {
   })
 }
 
+const scheduler = new RuntimeScheduler({
+  getMaxConcurrentStarts,
+  getMaxActiveProfiles,
+  getLaunchRetries: getMaxLaunchRetries,
+  getRunningCount: () => runtimeContexts.size,
+  onStart: launchRuntimeNow,
+  onStatusChange: updateProfileStatus,
+  onError: async (profileId, error) => {
+    audit('start_profile_err', { profileId, err: String(error) })
+    logEvent(
+      'error',
+      'runtime',
+      error instanceof Error ? error.message : 'Unknown runtime error',
+      profileId,
+    )
+  },
+})
+
 async function enqueueLaunch(profileId: string): Promise<void> {
-  cancelledLaunches.delete(profileId)
-  if (runtimeContexts.has(profileId) || queuedProfileIds.has(profileId) || startingProfileIds.has(profileId)) {
+  if (runtimeContexts.has(profileId)) {
     audit('enqueue_skip_existing', { profileId })
     return
   }
-  if (launchQueue.length > MAX_QUEUE) {
-    audit('enqueue_rejected_queue_full', { profileId, queueLen: launchQueue.length })
+  if (scheduler.getQueuedIds().length > MAX_QUEUE) {
+    audit('enqueue_rejected_queue_full', { profileId, queueLen: scheduler.getQueuedIds().length })
     throw new Error('launch queue is full')
   }
-  audit('enqueue', { profileId, queueLen: launchQueue.length + 1 })
-  queuedProfileIds.add(profileId)
-  launchQueue.push(profileId)
-  await updateProfileStatus(profileId, 'queued')
-  void processLaunchQueue()
-}
-
-async function processLaunchQueue(): Promise<void> {
-  if (launchQueueActive) {
+  const accepted = scheduler.enqueue(profileId)
+  if (!accepted) {
+    audit('enqueue_skip_existing', { profileId })
     return
   }
-  launchQueueActive = true
-  audit('processLaunchQueue_start', {
-    queueLen: launchQueue.length,
-    activeStarting: Array.from(startingProfileIds),
-    activeRunning: Array.from(runtimeContexts.keys()),
-  })
-  try {
-    while (
-      launchQueue.length > 0 &&
-      startingProfileIds.size < getMaxConcurrentStarts() &&
-      runtimeContexts.size + startingProfileIds.size < getMaxActiveProfiles()
-    ) {
-      const profileId = launchQueue.shift()
-      if (!profileId) {
-        break
-      }
-      if (cancelledLaunches.has(profileId)) {
-        audit('processLaunchQueue_skip_cancelled', { profileId })
-        continue
-      }
-      if (startingProfileIds.has(profileId)) {
-        audit('processLaunchQueue_skip_already_starting', { profileId })
-        continue
-      }
-      queuedProfileIds.delete(profileId)
-      startingProfileIds.add(profileId)
-      audit('processLaunchQueue_dequeue', {
-        profileId,
-        currentStartingCount: startingProfileIds.size,
-        queueRemaining: launchQueue.length,
-      })
-
-      void (async () => {
-        try {
-          await updateProfileStatus(profileId, 'starting')
-          await launchRuntimeNow(profileId)
-          launchRetryCounts.delete(profileId)
-          audit('start_profile_ok', { profileId })
-        } catch (error) {
-          if (error instanceof Error && error.message === 'Launch cancelled') {
-            launchRetryCounts.delete(profileId)
-            audit('start_profile_cancelled', { profileId })
-            await updateProfileStatus(profileId, 'stopped')
-            return
-          }
-          const retries = (launchRetryCounts.get(profileId) ?? 0) + 1
-          launchRetryCounts.set(profileId, retries)
-          if (retries <= getMaxLaunchRetries()) {
-            queuedProfileIds.add(profileId)
-            launchQueue.push(profileId)
-            await updateProfileStatus(profileId, 'queued')
-            audit('start_profile_retry', { profileId, retries, maxRetries: getMaxLaunchRetries() })
-            logEvent('warn', 'runtime', `Retrying launch for profile ${profileId} (${retries}/${getMaxLaunchRetries()})`, profileId)
-          } else {
-            await updateProfileStatus(profileId, 'error')
-            audit('start_profile_err', { profileId, err: String(error) })
-            logEvent(
-              'error',
-              'runtime',
-              error instanceof Error ? error.message : 'Unknown runtime error',
-              profileId,
-            )
-          }
-        } finally {
-          startingProfileIds.delete(profileId)
-          setImmediate(() => {
-            void processLaunchQueue()
-          })
-        }
-      })()
-    }
-  } finally {
-    launchQueueActive = false
-    audit('processLaunchQueue_end', {
-      queueLen: launchQueue.length,
-      startingCount: startingProfileIds.size,
-      activeRunning: runtimeContexts.size,
-    })
-  }
+  audit('enqueue', { profileId, queueLen: scheduler.getQueuedIds().length })
 }
 
 async function registerIpcHandlers(): Promise<void> {
@@ -1246,10 +1012,11 @@ async function registerIpcHandlers(): Promise<void> {
   })
   ipcMain.handle('runtime.getStatus', async () => ({
     runningProfileIds: [...runtimeContexts.keys()],
-    queuedProfileIds: [...queuedProfileIds],
-    startingProfileIds: [...startingProfileIds],
-    retryCounts: Object.fromEntries(launchRetryCounts.entries()),
+    queuedProfileIds: scheduler.getQueuedIds(),
+    startingProfileIds: scheduler.getStartingIds(),
+    retryCounts: scheduler.getRetryCounts(),
   }))
+  ipcMain.handle('runtime.getHostInfo', async () => getRuntimeHostInfo())
 
   ipcMain.handle('logs.list', async () => requireDatabase().listLogs())
   ipcMain.handle('logs.clear', async () => requireDatabase().clearLogs())

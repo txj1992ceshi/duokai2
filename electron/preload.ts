@@ -80,6 +80,7 @@ const api: DesktopApi = {
     launch: (profileId: string) => ipcRenderer.invoke('runtime.launch', profileId),
     stop: (profileId: string) => ipcRenderer.invoke('runtime.stop', profileId),
     getStatus: () => ipcRenderer.invoke('runtime.getStatus'),
+    getHostInfo: () => ipcRenderer.invoke('runtime.getHostInfo'),
   },
   logs: {
     list: () => ipcRenderer.invoke('logs.list'),

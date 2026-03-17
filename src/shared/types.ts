@@ -203,6 +203,14 @@ export interface RuntimeStatus {
   retryCounts: Record<string, number>
 }
 
+export interface RuntimeHostInfo {
+  kind: 'local' | 'container' | 'vm' | 'cloud-phone'
+  label: string
+  available: boolean
+  reason: string
+  activeHosts: number
+}
+
 export interface ProxyTestResult {
   success: boolean
   message: string

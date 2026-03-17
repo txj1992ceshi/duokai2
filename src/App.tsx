@@ -25,6 +25,8 @@ import type {
   ProfileRecord,
   ProxyRecord,
   ProxyType,
+  RuntimeHostInfo,
+  RuntimeStatus,
   SettingsPayload,
   TemplateRecord,
 } from './shared/types'
@@ -382,6 +384,8 @@ function App() {
     chromiumExecutable?: string
   } | null>(null)
   const [runtimeInfo, setRuntimeInfo] = useState<DesktopRuntimeInfo | null>(null)
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null)
+  const [runtimeHostInfo, setRuntimeHostInfo] = useState<RuntimeHostInfo | null>(null)
   const [busyMessage, setBusyMessage] = useState('')
   const [noticeMessage, setNoticeMessage] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
@@ -408,6 +412,39 @@ function App() {
       cloudPhoneProviderHealth.find((item) => item.key === defaultCloudPhoneProvider) ?? null,
     [cloudPhoneProviderHealth, defaultCloudPhoneProvider],
   )
+  const latestNetworkCheck = useMemo(() => {
+    const candidates = profiles
+      .map((profile) => ({
+        profile,
+        resolvedAt: profile.fingerprintConfig.runtimeMetadata.lastResolvedAt,
+        checkedAt: profile.fingerprintConfig.runtimeMetadata.lastProxyCheckAt,
+      }))
+      .filter(
+        (item) =>
+          Boolean(item.resolvedAt) ||
+          Boolean(item.checkedAt) ||
+          Boolean(item.profile.fingerprintConfig.runtimeMetadata.lastResolvedIp),
+      )
+      .sort((left, right) => {
+        const leftTime = new Date(left.resolvedAt || left.checkedAt || left.profile.updatedAt).getTime()
+        const rightTime = new Date(right.resolvedAt || right.checkedAt || right.profile.updatedAt).getTime()
+        return rightTime - leftTime
+      })
+    const latest = candidates[0]
+    if (!latest) {
+      return null
+    }
+    const metadata = latest.profile.fingerprintConfig.runtimeMetadata
+    return {
+      profileName: latest.profile.name,
+      success: metadata.lastProxyCheckSuccess,
+      ip: metadata.lastResolvedIp,
+      country: metadata.lastResolvedCountry || metadata.lastResolvedRegion,
+      timezone: metadata.lastResolvedTimezone,
+      message: metadata.lastProxyCheckMessage || '',
+      checkedAt: metadata.lastProxyCheckAt || metadata.lastResolvedAt || latest.profile.updatedAt,
+    }
+  }, [profiles])
   const profileBackLabel = locale === 'zh-CN' ? '返回列表' : 'Back to list'
   const cloudPhoneBackLabel = locale === 'zh-CN' ? '返回列表' : 'Back to list'
   const showProfileWorkspaceList = resourceMode === 'profiles' && profilePageMode === 'list'
@@ -516,6 +553,8 @@ function App() {
     const api = requireDesktopApi([
       'meta.getInfo',
       'dashboard.summary',
+      'runtime.getStatus',
+      'runtime.getHostInfo',
       'cloudPhones.list',
       'cloudPhones.listProviders',
       'cloudPhones.getProviderHealth',
@@ -529,6 +568,8 @@ function App() {
     ])
     const [
       dashboard,
+      nextRuntimeStatus,
+      nextRuntimeHostInfo,
       nextCloudPhones,
       nextCloudPhoneProviders,
       nextCloudPhoneProviderHealth,
@@ -542,6 +583,8 @@ function App() {
     ] =
       await Promise.all([
         api.dashboard.summary(),
+        api.runtime.getStatus(),
+        api.runtime.getHostInfo(),
         api.cloudPhones.list(),
         api.cloudPhones.listProviders(),
         api.cloudPhones.getProviderHealth(),
@@ -556,6 +599,8 @@ function App() {
     const info = await api.meta.getInfo()
 
     setSummary(dashboard)
+    setRuntimeStatus(nextRuntimeStatus)
+    setRuntimeHostInfo(nextRuntimeHostInfo)
     setCloudPhones(nextCloudPhones)
     setCloudPhoneProviders(nextCloudPhoneProviders)
     setCloudPhoneProviderHealth(nextCloudPhoneProviderHealth)
@@ -1297,6 +1342,57 @@ function App() {
               </strong>
               <small>{directoryInfo?.chromiumExecutable ?? t.dashboard.installChromium}</small>
             </article>
+            <section className="metric-card metric-card-compact status-summary-card">
+              <div className="status-summary-row">
+                <span>{locale === 'zh-CN' ? '运行宿主' : 'Runtime host'}</span>
+                <strong>
+                  {runtimeHostInfo
+                    ? runtimeHostInfo.available
+                      ? runtimeHostInfo.label
+                      : locale === 'zh-CN'
+                        ? '降级'
+                        : 'Fallback'
+                    : t.common.loading}
+                </strong>
+                <small>
+                  {runtimeHostInfo
+                    ? `${runtimeHostInfo.reason} · ${locale === 'zh-CN' ? '运行中' : 'Running'} ${
+                        runtimeStatus?.runningProfileIds.length ?? 0
+                      } · ${locale === 'zh-CN' ? '排队' : 'Queued'} ${
+                        runtimeStatus?.queuedProfileIds.length ?? 0
+                      }`
+                    : t.common.loading}
+                </small>
+              </div>
+              <div className="status-summary-row">
+                <span>{locale === 'zh-CN' ? '网络检查' : 'Network check'}</span>
+                <strong>
+                  {latestNetworkCheck
+                    ? latestNetworkCheck.success === false
+                      ? locale === 'zh-CN'
+                        ? '失败'
+                        : 'Failed'
+                      : locale === 'zh-CN'
+                        ? '正常'
+                        : 'Ready'
+                    : t.common.loading}
+                </strong>
+                <small>
+                  {latestNetworkCheck
+                    ? `${latestNetworkCheck.profileName} · ${
+                        latestNetworkCheck.ip || (locale === 'zh-CN' ? '未解析' : 'unresolved')
+                      } · ${
+                        latestNetworkCheck.country || (locale === 'zh-CN' ? '未知地区' : 'unknown')
+                      } · ${
+                        latestNetworkCheck.timezone ||
+                        (locale === 'zh-CN' ? '未生成时区' : 'timezone pending')
+                      }`
+                    : locale === 'zh-CN'
+                      ? '最近一次代理/出口检查结果。'
+                      : 'Latest proxy/egress check result.'}
+                </small>
+              </div>
+            </section>
             <section className="wide-card">
               <div className="section-title">
                 <h2>{t.dashboard.recentLogs}</h2>
